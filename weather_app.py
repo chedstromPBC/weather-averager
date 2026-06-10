@@ -138,32 +138,35 @@ def process_data(df, start_hour, end_hour, location_name, start_date, end_date, 
     agg = agg.merge(wind_dirs, on="night_of")
     agg["avg_wind_dir_compass"] = agg["avg_wind_dir_deg"].apply(deg_to_compass)
 
-    # Hourly temps
-    hourly_detail_f = (
-        filtered.sort_values("datetime")
-        .groupby("night_of")["temp_f"]
-        .apply(lambda x: ", ".join(f"{v}" for v in x))
-        .reset_index()
-        .rename(columns={"temp_f": "hourly_temps_f"})
-    )
-    hourly_detail_c = (
-        filtered.sort_values("datetime")
-        .groupby("night_of")["temp_c"]
-        .apply(lambda x: ", ".join(f"{v:.1f}" for v in x))
-        .reset_index()
-        .rename(columns={"temp_c": "hourly_temps_c"})
-    )
-
-    agg = agg.merge(hourly_detail_f, on="night_of")
-    agg = agg.merge(hourly_detail_c, on="night_of")
+    # Hourly temps as separate columns
+    hourly_pivot = filtered.sort_values("datetime").pivot_table(
+        index="night_of",
+        columns="hour",
+        values=["temp_f", "temp_c"],
+        aggfunc="first"
+    ).reset_index()
+    
+    # Flatten column names
+    hourly_pivot.columns = [f"{'temp_f' if col[0] == 'temp_f' else 'temp_c'}_{col[1]:02d}" 
+                            if col[1] != '' else col[0] 
+                            for col in hourly_pivot.columns]
+    
+    agg = agg.merge(hourly_pivot, on="night_of", how="left")
 
     # Column order for display
     col_order = [
         "night_of", "avg_temp_f", "avg_temp_c", "avg_dew_point_f", "avg_dew_point_c",
         "avg_soil_temp_f", "avg_soil_temp_c", "avg_wind_mph", "avg_wind_dir_deg",
-        "avg_wind_dir_compass", "total_rain_in", "hourly_temps_f", "hourly_temps_c",
+        "avg_wind_dir_compass", "total_rain_in",
     ]
-    agg = agg[col_order]
+    
+    # Add hourly temp columns in order
+    hourly_cols = sorted([c for c in agg.columns if c.startswith("temp_f_")])
+    col_order.extend(hourly_cols)
+    hourly_cols_c = sorted([c for c in agg.columns if c.startswith("temp_c_")])
+    col_order.extend(hourly_cols_c)
+    
+    agg = agg[[c for c in col_order if c in agg.columns]]
 
     # Summary stats
     fmt_s = fmt_hour(start_hour)
@@ -251,8 +254,13 @@ if st.button("Fetch Data", type="primary"):
                 
                 # Data table
                 st.subheader("Nightly Averages")
-                display_cols = [c for c in agg.columns if c not in ["hourly_temps_f", "hourly_temps_c"]]
+                display_cols = [c for c in agg.columns if not c.startswith("temp_f_") and not c.startswith("temp_c_")]
                 st.dataframe(agg[display_cols], use_container_width=True, hide_index=True)
+                
+                # Hourly temps table
+                st.subheader("Hourly Temperatures (°F)")
+                hourly_cols = ["night_of"] + sorted([c for c in agg.columns if c.startswith("temp_f_")])
+                st.dataframe(agg[hourly_cols], use_container_width=True, hide_index=True)
                 
                 # Download button
                 st.download_button(

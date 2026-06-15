@@ -273,4 +273,4 @@ if st.button("Fetch Data", type="primary"):
             st.error(f"Error: {e}")
 
 st.info("Data source: Open-Meteo (open-meteo.com) — Free historical weather data for any location")
-`	
+

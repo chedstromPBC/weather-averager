@@ -38,44 +38,59 @@ def fmt_hour(h):
     return f"{h % 12 or 12} {'AM' if h < 12 else 'PM'}"
 
 
+import time
+
 @st.cache_data(ttl=3600)
 def fetch_openmeteo(lat, lon, start_date, end_date):
-    """Fetch Open-Meteo data."""
-    url = "https://archive-api.open-meteo.com/v1/archive"
-    params = {
-        "latitude": lat,
-        "longitude": lon,
-        "start_date": start_date,
-        "end_date": end_date,
-        "hourly": ",".join([
-            "temperature_2m",
-            "wind_speed_10m",
-            "wind_direction_10m",
-            "rain",
-        ]),
-        "temperature_unit": "fahrenheit",
-        "wind_speed_unit": "mph",
-        "precipitation_unit": "inch",
-        "timezone": "America/Los_Angeles",
-    }
+    """Fetch Open-Meteo data with retry logic for rate limits."""
+    max_retries = 3
+    retry_delay = 2
+    
+    for attempt in range(max_retries):
+        try:
+            url = "https://archive-api.open-meteo.com/v1/archive"
+            params = {
+                "latitude": lat,
+                "longitude": lon,
+                "start_date": start_date,
+                "end_date": end_date,
+                "hourly": ",".join([
+                    "temperature_2m",
+                    "wind_speed_10m",
+                    "wind_direction_10m",
+                    "rain",
+                ]),
+                "temperature_unit": "fahrenheit",
+                "wind_speed_unit": "mph",
+                "precipitation_unit": "inch",
+                "timezone": "America/Los_Angeles",
+            }
 
-    resp = requests.get(url, params=params)
-    resp.raise_for_status()
-    data = resp.json()
+            resp = requests.get(url, params=params)
+            resp.raise_for_status()
+            data = resp.json()
 
-    hourly = data["hourly"]
-    df = pd.DataFrame({
-        "datetime": pd.to_datetime(hourly["time"]),
-        "temp_f": hourly["temperature_2m"],
-        "wind_speed_mph": hourly["wind_speed_10m"],
-        "wind_dir_deg": hourly["wind_direction_10m"],
-        "rain_in": hourly["rain"],
-    })
+            hourly = data["hourly"]
+            df = pd.DataFrame({
+                "datetime": pd.to_datetime(hourly["time"]),
+                "temp_f": hourly["temperature_2m"],
+                "wind_speed_mph": hourly["wind_speed_10m"],
+                "wind_dir_deg": hourly["wind_direction_10m"],
+                "rain_in": hourly["rain"],
+            })
 
-    df["hour"] = df["datetime"].dt.hour
-    df["date"] = df["datetime"].dt.date
+            df["hour"] = df["datetime"].dt.hour
+            df["date"] = df["datetime"].dt.date
 
-    return df
+            return df
+        
+        except requests.exceptions.HTTPError as e:
+            if e.response.status_code == 429:
+                if attempt < max_retries - 1:
+                    time.sleep(retry_delay)
+                    retry_delay *= 2  # Exponential backoff
+                    continue
+            raise
 
 
 def process_data(df, start_hour, end_hour, location_name, start_date, end_date, source):
@@ -259,3 +274,4 @@ if st.button("Fetch Data", type="primary"):
             st.error(f"Error: {e}")
 
 st.info("Data source: Open-Meteo (open-meteo.com) — Free historical weather data for any location")
+

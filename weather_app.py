@@ -38,6 +38,7 @@ def fmt_hour(h):
     return f"{h % 12 or 12} {'AM' if h < 12 else 'PM'}"
 
 
+@st.cache_data(ttl=3600)
 def fetch_openmeteo(lat, lon, start_date, end_date):
     """Fetch Open-Meteo data."""
     url = "https://archive-api.open-meteo.com/v1/archive"

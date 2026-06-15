@@ -51,8 +51,6 @@ def fetch_openmeteo(lat, lon, start_date, end_date):
             "wind_speed_10m",
             "wind_direction_10m",
             "rain",
-            "dew_point_2m",
-            "soil_temperature_0_to_7cm",
         ]),
         "temperature_unit": "fahrenheit",
         "wind_speed_unit": "mph",
@@ -71,13 +69,7 @@ def fetch_openmeteo(lat, lon, start_date, end_date):
         "wind_speed_mph": hourly["wind_speed_10m"],
         "wind_dir_deg": hourly["wind_direction_10m"],
         "rain_in": hourly["rain"],
-        "dew_point_f": hourly["dew_point_2m"],
-        "soil_temp_f": hourly["soil_temperature_0_to_7cm"],
     })
-    
-    df["temp_c"] = ((df["temp_f"] - 32) * 5/9).round(1)
-    df["dew_point_c"] = ((df["dew_point_f"] - 32) * 5/9).round(1)
-    df["soil_temp_c"] = ((df["soil_temp_f"] - 32) * 5/9).round(1)
 
     df["hour"] = df["datetime"].dt.hour
     df["date"] = df["datetime"].dt.date
@@ -118,13 +110,8 @@ def process_data(df, start_hour, end_hour, location_name, start_date, end_date, 
     # Aggregate
     agg = grouped.agg(
         avg_temp_f=("temp_f", "mean"),
-        avg_temp_c=("temp_c", "mean"),
         avg_wind_mph=("wind_speed_mph", "mean"),
         total_rain_in=("rain_in", "sum"),
-        avg_dew_point_f=("dew_point_f", "mean"),
-        avg_dew_point_c=("dew_point_c", "mean"),
-        avg_soil_temp_f=("soil_temp_f", "mean"),
-        avg_soil_temp_c=("soil_temp_c", "mean"),
     ).reset_index()
 
     # Round
@@ -155,16 +142,13 @@ def process_data(df, start_hour, end_hour, location_name, start_date, end_date, 
 
     # Column order for display
     col_order = [
-        "night_of", "avg_temp_f", "avg_temp_c", "avg_dew_point_f", "avg_dew_point_c",
-        "avg_soil_temp_f", "avg_soil_temp_c", "avg_wind_mph", "avg_wind_dir_deg",
+        "night_of", "avg_temp_f", "avg_wind_mph", "avg_wind_dir_deg",
         "avg_wind_dir_compass", "total_rain_in",
     ]
     
     # Add hourly temp columns in order
     hourly_cols = sorted([c for c in agg.columns if c.startswith("temp_f_")])
     col_order.extend(hourly_cols)
-    hourly_cols_c = sorted([c for c in agg.columns if c.startswith("temp_c_")])
-    col_order.extend(hourly_cols_c)
     
     agg = agg[[c for c in col_order if c in agg.columns]]
 
@@ -254,7 +238,7 @@ if st.button("Fetch Data", type="primary"):
                 
                 # Data table
                 st.subheader("Nightly Averages")
-                display_cols = [c for c in agg.columns if not c.startswith("temp_f_") and not c.startswith("temp_c_")]
+                display_cols = [c for c in agg.columns if not c.startswith("temp_f_")]
                 st.dataframe(agg[display_cols], use_container_width=True, hide_index=True)
                 
                 # Hourly temps table

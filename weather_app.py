@@ -145,13 +145,12 @@ def process_data(df, start_hour, end_hour, location_name, start_date, end_date, 
     hourly_pivot = filtered.sort_values("datetime").pivot_table(
         index="night_of",
         columns="hour",
-        values=["temp_f", "temp_c"],
+        values="temp_f",
         aggfunc="first"
     ).reset_index()
     
     # Flatten column names
-    hourly_pivot.columns = [f"{'temp_f' if col[0] == 'temp_f' else 'temp_c'}_{col[1]:02d}" 
-                            if col[1] != '' else col[0] 
+    hourly_pivot.columns = [f"temp_f_{col:02d}" if isinstance(col, int) else col 
                             for col in hourly_pivot.columns]
     
     agg = agg.merge(hourly_pivot, on="night_of", how="left")
@@ -274,4 +273,4 @@ if st.button("Fetch Data", type="primary"):
             st.error(f"Error: {e}")
 
 st.info("Data source: Open-Meteo (open-meteo.com) — Free historical weather data for any location")
-
+`	

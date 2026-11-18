@@ -10,6 +10,7 @@ One place for:
 Data sources:
   • Open-Meteo (free, no key; ERA5 reanalysis + recent forecast-model data)
   • Visual Crossing (needs VISUAL_CROSSING_API_KEY environment variable)
+  • CIMIS weather stations (needs CIMIS_APPKEY environment variable; new 2026 CIMIS Web API)
 
 Deploy (Render):
   Start command: streamlit run weather_tool.py --server.port=10000 --server.address=0.0.0.0
@@ -28,6 +29,7 @@ import pandas as pd
 import requests
 
 VISUAL_CROSSING_KEY = os.getenv("VISUAL_CROSSING_API_KEY", "")
+CIMIS_KEY = os.getenv("CIMIS_APPKEY", "")
 
 # Variables the user can pick: label -> (column name, how to aggregate)
 VARIABLES = {
@@ -38,9 +40,18 @@ VARIABLES = {
     "Rainfall (in)": ("rain_in", "sum"),
     "Dew point (°F)": ("dew_point_f", "mean"),
     "Relative humidity (%)": ("rh_pct", "mean"),
-    "Soil temp 0–7 cm (°F)": ("soil_temp_f", "mean"),
+    "Soil temp (°F)": ("soil_temp_f", "mean"),
 }
-OPEN_METEO_ONLY = {"Soil temp 0–7 cm (°F)"}
+# Variables a source can't supply
+NOT_AVAILABLE = {
+    "Open-Meteo": set(),
+    "Visual Crossing": {"Soil temp (°F)"},
+    "CIMIS station": {"Wind gust (mph)"},
+}
+SOIL_NOTE = {
+    "Open-Meteo": "soil temp is modeled 0–7 cm (0 cm for the last few days)",
+    "CIMIS station": "soil temp is measured at 15 cm under irrigated grass",
+}
 
 
 # ─────────────────────────── Data fetching ───────────────────────────
@@ -127,6 +138,119 @@ def fetch_visual_crossing(lat, lon, start, end):
             })
     meta = {"grid_lat": j.get("latitude"), "grid_lon": j.get("longitude"), "elev_m": None}
     return pd.DataFrame(rows), meta
+
+
+# ── CIMIS (new Web API, live since June 2026; key goes in a header) ──
+CIMIS_BASE = "https://et.water.ca.gov/StationWeb"
+CIMIS_HOURLY = {
+    "HlyAirTmp": "temp_f", "HlyWindSpd": "wind_speed_mph", "HlyWindDir": "wind_dir_deg",
+    "HlyPrecip": "rain_in", "HlyDewPnt": "dew_point_f", "HlyRelHum": "rh_pct", "HlySoilTmp": "soil_temp_f",
+}
+CIMIS_HOURLY_ITEMS = "hly-air-tmp,hly-wind-spd,hly-wind-dir,hly-precip,hly-dew-pnt,hly-rel-hum,hly-soil-tmp"
+CIMIS_BAD_QC = {"M", "N", "Q", "R", "S"}  # missing / not collected / related sensor missing / far out of range / not in service
+
+
+def _cimis_get(path, key, params=None):
+    r = requests.get(f"{CIMIS_BASE}/{path}", params=params, timeout=90,
+                     headers={"Ocp-Apim-Subscription-Key": key, "Accept": "application/json"})
+    if r.status_code == 401:
+        raise RuntimeError("CIMIS rejected the key (401). Check CIMIS_APPKEY — it must be a key from the new CIMIS system.")
+    r.raise_for_status()
+    try:
+        return r.json()
+    except ValueError:
+        raise RuntimeError("CIMIS returned a non-JSON page (often a 'Request Rejected' firewall page).")
+
+
+def _num(v):
+    try:
+        return float(str(v).split("/")[-1].strip())
+    except (TypeError, ValueError):
+        return np.nan
+
+
+@lru_cache(maxsize=4)
+def cimis_stations(key):
+    j = _cimis_get("GetAllStations", key)
+    rows = []
+    for st_ in j.get("Stations", []):
+        rows.append({
+            "nbr": int(st_["StationNbr"]), "name": st_.get("Name", ""), "county": st_.get("County", ""),
+            "lat": _num(st_.get("HmsLatitude")), "lon": _num(st_.get("HmsLongitude")),
+            "elev_ft": _num(st_.get("Elevation")), "active": str(st_.get("IsActive")).lower() == "true",
+        })
+    return pd.DataFrame(rows)
+
+
+def nearest_stations(stations, lat, lon, n=10):
+    s = stations[stations["active"]].dropna(subset=["lat", "lon"]).copy()
+    p1, p2 = np.radians(lat), np.radians(s["lat"])
+    dlat, dlon = p2 - p1, np.radians(s["lon"] - lon)
+    a = np.sin(dlat / 2) ** 2 + np.cos(p1) * np.cos(p2) * np.sin(dlon / 2) ** 2
+    s["miles"] = 3958.8 * 2 * np.arcsin(np.sqrt(a))
+    return s.nsmallest(n, "miles")
+
+
+def _cimis_records(j):
+    for prov in (j.get("Data") or {}).get("Providers", []) or []:
+        yield from prov.get("Records", []) or []
+
+
+def _cimis_val(rec, field):
+    cell = rec.get(field) or {}
+    if cell.get("Value") in (None, "") or str(cell.get("Qc", "")).strip() in CIMIS_BAD_QC:
+        return np.nan
+    return float(cell["Value"])
+
+
+def _cimis_chunks(key, station, start, end, hourly, items, days=30):
+    """Request in chunks; split a chunk in half if CIMIS refuses it (data-volume limit)."""
+    out, d0, d1 = [], date.fromisoformat(start), date.fromisoformat(end)
+    queue = []
+    while d0 <= d1:
+        queue.append((d0, min(d0 + timedelta(days=days - 1), d1)))
+        d0 += timedelta(days=days)
+    while queue:
+        a, b = queue.pop(0)
+        params = {"stationNbrs": station, "startDate": a.isoformat(), "endDate": b.isoformat(),
+                  "isHourly": "true" if hourly else "false", "unitOfMeasure": "E", "dataItems": items}
+        try:
+            out.extend(_cimis_records(_cimis_get("GetDataByStationNumber", key, params)))
+        except RuntimeError:
+            raise
+        except Exception:
+            if a == b:
+                raise
+            mid = a + (b - a) // 2
+            queue[:0] = [(a, mid), (mid + timedelta(days=1), b)]
+    return out
+
+
+@lru_cache(maxsize=32)
+def fetch_cimis(station, start, end, key):
+    """Hourly station data. CIMIS hours are hour-ending Pacific Standard Time (0100–2400);
+    each is stamped at the start of its hour so all 24 stay on their calendar day."""
+    rows = []
+    for rec in _cimis_chunks(key, station, start, end, True, CIMIS_HOURLY_ITEMS):
+        hr = int(rec["Hour"]) // 100
+        row = {"datetime": pd.Timestamp(rec["Date"]) + pd.Timedelta(hours=hr - 1)}
+        for field, col in CIMIS_HOURLY.items():
+            row[col] = _cimis_val(rec, field)
+        rows.append(row)
+    df = pd.DataFrame(rows, columns=["datetime"] + list(CIMIS_HOURLY.values()))
+    df["wind_gust_mph"] = np.nan
+    df = df.sort_values("datetime").drop_duplicates("datetime").reset_index(drop=True)
+    return df, {}
+
+
+@lru_cache(maxsize=32)
+def fetch_cimis_daily_maxmin(station, start, end, key):
+    """Daily max/min from the station's 1-minute readings (what UC IPM uses), midnight–midnight PST."""
+    rows = []
+    for rec in _cimis_chunks(key, station, start, end, False, "day-air-tmp-max,day-air-tmp-min", days=365):
+        rows.append({"day": pd.Timestamp(rec["Date"]), "max": _cimis_val(rec, "DayAirTmpMax"),
+                     "min": _cimis_val(rec, "DayAirTmpMin")})
+    return pd.DataFrame(rows, columns=["day", "max", "min"]).drop_duplicates("day").set_index("day").sort_index()
 
 
 # ─────────────────────────── Aggregation ───────────────────────────
@@ -266,9 +390,15 @@ def daily_dd(mn, mx, lower, upper=None, method="Single sine", cutoff="Horizontal
     return dd
 
 
-def degree_day_table(hourly, lower, upper, method, cutoff, biofix, end):
-    """Daily max/min (full 24 h) -> daily and cumulative DD from biofix."""
+def degree_day_table(hourly, lower, upper, method, cutoff, biofix, end, daily_maxmin=None):
+    """Daily max/min -> daily and cumulative DD from biofix.
+    Uses station daily max/min when given (CIMIS), otherwise the max/min of the 24 hourly values."""
     d = hourly.assign(day=hourly["datetime"].dt.normalize()).groupby("day")["temp_f"].agg(["max", "min", "count"])
+    if daily_maxmin is not None and len(daily_maxmin):
+        d = d.reindex(d.index.union(daily_maxmin.index))
+        for c in ("max", "min"):
+            d[c] = daily_maxmin[c].reindex(d.index).fillna(d[c])  # fall back to hourly if a day is missing
+        d["count"] = d["count"].fillna(0).astype(int)
     d = d[(d.index >= pd.Timestamp(biofix)) & (d.index <= pd.Timestamp(end))]
     d["DD"] = [round(daily_dd(r["min"], r["max"], lower, upper, method, cutoff), 2) for _, r in d.iterrows()]
     d["Cumulative DD"] = d["DD"].cumsum().round(1)
@@ -297,12 +427,28 @@ def main():
         start = st.date_input("Start date", today - timedelta(days=30))
         end = st.date_input("End date", today - timedelta(days=1))
 
-        sources = ["Open-Meteo"] + (["Visual Crossing"] if VISUAL_CROSSING_KEY else [])
-        source = st.radio("Data source", sources, horizontal=True)
+        sources = ["Open-Meteo"] + (["Visual Crossing"] if VISUAL_CROSSING_KEY else []) + ["CIMIS station"]
+        source = st.radio("Data source", sources)
+
+        station, station_label, cimis_key = None, "", CIMIS_KEY
+        if source == "CIMIS station":
+            if not cimis_key:
+                cimis_key = st.text_input("CIMIS app key", type="password",
+                                          help="Set CIMIS_APPKEY on Render so you don't have to paste it.")
+            if cimis_key:
+                try:
+                    near = nearest_stations(cimis_stations(cimis_key), lat, lon)
+                    labels = {int(r.nbr): f"#{r.nbr} {r.name} ({r.county}) · {r.miles:.0f} mi"
+                              for r in near.itertuples()}
+                    station = st.selectbox("Station (nearest active to your lat/long)", list(labels),
+                                           format_func=labels.get)
+                    station_label = labels[station]
+                except Exception as e:
+                    st.error(f"Couldn't load the CIMIS station list: {e}")
 
     # ── Weather section ──
     st.subheader("1 · Weather variables")
-    avail = [v for v in VARIABLES if not (source != "Open-Meteo" and v in OPEN_METEO_ONLY)]
+    avail = [v for v in VARIABLES if v not in NOT_AVAILABLE[source]]
     picked = st.multiselect("Variables", avail, default=["Air temperature (°F)", "Wind speed (mph)", "Wind direction"])
 
     c1, c2, c3 = st.columns([1.2, 1, 1])
@@ -328,6 +474,9 @@ def main():
         target = st.number_input("Optional target DD (e.g. egg hatch, next generation) — 0 to skip", value=0.0, step=10.0)
         if not has_upper:
             upper = None
+        use_station_maxmin = source == "CIMIS station" and st.checkbox(
+            "Use the station's daily max/min for degree days (matches UC IPM)", value=True,
+            help="CIMIS daily max/min come from 1-minute readings. Unchecked = max/min of the hourly averages, which runs a bit lower.")
 
     if not st.button("Fetch & calculate", type="primary"):
         st.caption("UC IPM's default is single sine with a horizontal cutoff.")
@@ -337,14 +486,24 @@ def main():
         st.error("End date is before start date.")
         return
 
+    if source == "CIMIS station" and station is None:
+        st.error("Pick a CIMIS station first (needs a valid CIMIS key).")
+        return
+
     fetch_start = min(start, biofix) if use_dd else start
     wraps = use_window and sh > eh
     # An overnight window that starts on the end date finishes the next morning
     fetch_end = min(end + timedelta(days=1), date.today()) if wraps else end
     try:
         with st.spinner(f"Fetching hourly data from {source}…"):
-            fn = fetch_open_meteo if source == "Open-Meteo" else fetch_visual_crossing
-            hourly, meta = fn(round(lat, 6), round(lon, 6), fetch_start.isoformat(), fetch_end.isoformat())
+            if source == "CIMIS station":
+                hourly, meta = fetch_cimis(station, fetch_start.isoformat(), fetch_end.isoformat(), cimis_key)
+            else:
+                fn = fetch_open_meteo if source == "Open-Meteo" else fetch_visual_crossing
+                hourly, meta = fn(round(lat, 6), round(lon, 6), fetch_start.isoformat(), fetch_end.isoformat())
+            station_maxmin = None
+            if use_dd and source == "CIMIS station" and use_station_maxmin:
+                station_maxmin = fetch_cimis_daily_maxmin(station, fetch_start.isoformat(), end.isoformat(), cimis_key)
     except Exception as e:
         st.error(f"Data fetch failed: {e}")
         return
@@ -356,6 +515,12 @@ def main():
         elev = f", elevation {meta['elev_m']:.0f} m" if meta.get("elev_m") is not None else ""
         st.caption(f"{source} data point used: {meta['grid_lat']:.4f}, {meta['grid_lon']:.4f}{elev}. "
                    "Values are modeled (gridded), not station observations.")
+    if source == "CIMIS station":
+        st.caption(f"CIMIS station {station_label}. Hours are Pacific Standard Time (no daylight saving). "
+                   "Readings flagged missing or far out of range by CIMIS QC are dropped.")
+    soil = "Soil temp (°F)" in picked and SOIL_NOTE.get(source)
+    if soil:
+        st.caption(f"Note: {soil}.")
 
     in_range = hourly[(hourly["datetime"] >= pd.Timestamp(start)) &
                       (hourly["datetime"] < pd.Timestamp(fetch_end) + pd.Timedelta(days=1))]
@@ -388,7 +553,7 @@ def main():
 
     # Degree-day results
     if use_dd:
-        dd = degree_day_table(hourly, lower, upper, method, cutoff, biofix, end)
+        dd = degree_day_table(hourly, lower, upper, method, cutoff, biofix, end, station_maxmin)
         dd["date"] = pd.to_datetime(dd["date"]).dt.date
         total = dd["Cumulative DD"].iloc[-1] if len(dd) else 0
         up_txt = f"{upper:g}°F ({cutoff.lower()} cutoff)" if upper is not None else "none"
@@ -401,7 +566,7 @@ def main():
             hit = dd[dd["Cumulative DD"] >= target]
             reached = str(hit["date"].iloc[0]) if len(hit) else f"not yet ({total:,.0f} of {target:,.0f})"
             m3.metric(f"Date {target:,.0f} DD reached", reached)
-        st.caption(f"Method: {method}; lower {lower:g}°F; upper {up_txt}. Uses each calendar day's hourly max/min.")
+        st.caption(f"Method: {method}; lower {lower:g}°F; upper {up_txt}. " + ("Uses the station's daily max/min." if station_maxmin is not None else "Uses each calendar day's hourly max/min."))
         incomplete = dd[dd["hours of data"] < 20]
         if len(incomplete):
             st.warning(f"{len(incomplete)} day(s) have fewer than 20 hourly readings; their max/min may be off.")
@@ -412,7 +577,8 @@ def main():
     # Download: one CSV with labeled sections
     if downloads:
         buf = io.StringIO()
-        buf.write(f"# {name} ({lat}, {lon}) | source: {source} | {start} to {end}\n")
+        src_txt = f"{source} {station_label}" if station_label else source
+        buf.write(f"# {name} ({lat}, {lon}) | source: {src_txt} | {start} to {end}\n")
         if use_dd:
             buf.write(f"# Degree days: {method}, lower {lower:g}F, upper {up_txt}, biofix {biofix}\n")
         for k, df in downloads.items():
@@ -422,6 +588,7 @@ def main():
         st.download_button("Download CSV", buf.getvalue(), f"{safe}_{start}_{end}.csv", "text/csv")
 
     st.caption("Sources: Open-Meteo Historical Weather API (open-meteo.com) · Visual Crossing (visualcrossing.com) · "
+               "CIMIS Web API (cimis.water.ca.gov) · "
                "Degree-day methods per UC IPM (ipm.ucanr.edu/WEATHER/ddconcepts.html)")
 
 

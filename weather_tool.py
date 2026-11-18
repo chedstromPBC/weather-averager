@@ -9,8 +9,8 @@ One place for:
 
 Data sources:
   • Open-Meteo (free, no key; ERA5 reanalysis + recent forecast-model data)
-  • Visual Crossing (needs VISUAL_CROSSING_API_KEY environment variable)
   • CIMIS weather stations (needs CIMIS_APPKEY environment variable; new 2026 CIMIS Web API)
+  • AgriMet weather stations (US Bureau of Reclamation, Pacific Northwest; public, no key)
 
 Deploy (Render):
   Start command: streamlit run weather_tool.py --server.port=10000 --server.address=0.0.0.0
@@ -28,7 +28,6 @@ import numpy as np
 import pandas as pd
 import requests
 
-VISUAL_CROSSING_KEY = os.getenv("VISUAL_CROSSING_API_KEY", "")
 CIMIS_KEY = os.getenv("CIMIS_APPKEY", "")
 
 # Variables the user can pick: label -> (column name, how to aggregate)
@@ -45,9 +44,10 @@ VARIABLES = {
 # Variables a source can't supply
 NOT_AVAILABLE = {
     "Open-Meteo": set(),
-    "Visual Crossing": {"Soil temp (°F)"},
     "CIMIS station": {"Wind gust (mph)"},
+    "AgriMet station": {"Soil temp (°F)"},
 }
+STATION_SOURCES = ("CIMIS station", "AgriMet station")
 SOIL_NOTE = {
     "Open-Meteo": "soil temp is modeled 0–7 cm (0 cm for the last few days)",
     "CIMIS station": "soil temp is measured at 15 cm under irrigated grass",
@@ -56,14 +56,20 @@ SOIL_NOTE = {
 
 # ─────────────────────────── Data fetching ───────────────────────────
 
-def _get_json(url, params, tries=4):
-    """GET with retry/backoff (Open-Meteo rate-limits shared server IPs)."""
+def _get_json(url, params, tries=4, retry_429=True):
+    """GET with retry/backoff (Open-Meteo rate-limits shared server IPs).
+    Errors never include the URL, because some sources put the API key in it."""
+    host = url.split("/")[2]
     for i in range(tries):
         r = requests.get(url, params=params, timeout=60)
-        if r.status_code == 429 and i < tries - 1:
+        if r.status_code == 429 and retry_429 and i < tries - 1:
             time.sleep(2 * (i + 1) ** 2)
             continue
-        r.raise_for_status()
+        if r.status_code == 429:
+            raise RuntimeError(f"{host} says too many requests (HTTP 429). "
+                               "Wait a minute and try again.")
+        if r.status_code >= 400:
+            raise RuntimeError(f"{host} returned HTTP {r.status_code}: {r.text[:200]}")
         return r.json()
 
 
@@ -117,27 +123,6 @@ def _om_frame(j):
         key = api_name if api_name in h else ("soil_temperature_0cm" if col == "soil_temp_f" else None)
         df[col] = h.get(key) if key and key in h else np.nan
     return df
-
-
-@lru_cache(maxsize=64)
-def fetch_visual_crossing(lat, lon, start, end):
-    url = (f"https://weather.visualcrossing.com/VisualCrossingWebServices/rest/services/"
-           f"timeline/{lat},{lon}/{start}/{end}")
-    params = {"key": VISUAL_CROSSING_KEY, "unitGroup": "us", "contentType": "json", "include": "hours",
-              "elements": "datetime,temp,windspeed,winddir,windgust,precip,dew,humidity"}
-    j = _get_json(url, params)
-    rows = []
-    for day in j.get("days", []):
-        for h in day.get("hours", []) or []:
-            rows.append({
-                "datetime": datetime.strptime(f"{day['datetime']} {h['datetime']}", "%Y-%m-%d %H:%M:%S"),
-                "temp_f": h.get("temp"), "wind_speed_mph": h.get("windspeed"),
-                "wind_dir_deg": h.get("winddir"), "wind_gust_mph": h.get("windgust"),
-                "rain_in": h.get("precip"), "dew_point_f": h.get("dew"), "rh_pct": h.get("humidity"),
-                "soil_temp_f": np.nan,
-            })
-    meta = {"grid_lat": j.get("latitude"), "grid_lon": j.get("longitude"), "elev_m": None}
-    return pd.DataFrame(rows), meta
 
 
 # ── CIMIS (new Web API, live since June 2026; key goes in a header) ──
@@ -251,6 +236,94 @@ def fetch_cimis_daily_maxmin(station, start, end, key):
         rows.append({"day": pd.Timestamp(rec["Date"]), "max": _cimis_val(rec, "DayAirTmpMax"),
                      "min": _cimis_val(rec, "DayAirTmpMin")})
     return pd.DataFrame(rows, columns=["day", "max", "min"]).drop_duplicates("day").set_index("day").sort_index()
+
+
+# ── AgriMet (US Bureau of Reclamation, Columbia-Pacific Northwest; public, no key) ──
+AGRIMET_BIN = "https://www.usbr.gov/pn-bin"
+AGRIMET_MAP = "https://www.usbr.gov/pn/agrimet/agrimetmap/usbr_map.json"
+# 15-minute codes: air temp, dew point, RH, wind speed, wind dir, gust, cumulative precip
+AGRIMET_CODES = {"ob": "temp_f", "tp": "dew_point_f", "tu": "rh_pct", "ws": "wind_speed_mph",
+                 "wd": "wind_dir_deg", "wg": "wind_gust_mph", "pc": "precip_cum_in"}
+
+
+def _get_text(url, params, tries=3):
+    host = url.split("/")[2]
+    for i in range(tries):
+        try:
+            r = requests.get(url, params=params, timeout=120)
+        except requests.RequestException:
+            if i == tries - 1:
+                raise RuntimeError(f"{host} didn't respond (it can be slow — try again or use a shorter range).")
+            time.sleep(3)
+            continue
+        if r.status_code >= 400:
+            raise RuntimeError(f"{host} returned HTTP {r.status_code}.")
+        return r.text
+
+
+@lru_cache(maxsize=1)
+def agrimet_stations():
+    j = _get_json(AGRIMET_MAP, None)
+    rows = []
+    for f in j.get("features", []):
+        p, (lo, la) = f.get("properties", {}), f["geometry"]["coordinates"][:2]
+        if p.get("type", "agrimet") != "agrimet":
+            continue
+        rows.append({"nbr": p["siteid"].lower(), "name": p.get("title", "").replace(" AgriMet", "").replace(" Weather Station", ""),
+                     "county": p.get("state", ""), "lat": float(la), "lon": float(lo),
+                     "install": p.get("install", ""), "active": True})
+    return pd.DataFrame(rows)
+
+
+def _agrimet_csv(script, site, codes, start, end):
+    params = {"list": ",".join(f"{site} {c}" for c in codes), "start": start, "end": end, "format": "csv"}
+    txt = _get_text(f"{AGRIMET_BIN}/{script}", params)
+    if not txt.lstrip().startswith("DateTime"):
+        raise RuntimeError("AgriMet returned an unexpected page instead of CSV data.")
+    df = pd.read_csv(io.StringIO(txt))
+    df.columns = [c.strip().lower() for c in df.columns]
+    df["datetime"] = pd.to_datetime(df.pop("datetime"), errors="coerce")
+    for c in df.columns.drop("datetime"):
+        df[c] = pd.to_numeric(df[c], errors="coerce")
+        df.loc[df[c].abs() >= 99999, c] = np.nan  # hydromet missing-value codes (e.g. 998877)
+    return df.dropna(subset=["datetime"])
+
+
+@lru_cache(maxsize=32)
+def fetch_agrimet(site, start, end):
+    """15-minute AgriMet readings rolled up to hourly. Times are local and follow daylight saving."""
+    parts, d0, d1 = [], date.fromisoformat(start), date.fromisoformat(end)
+    while d0 <= d1:  # month-sized requests keep the server responsive
+        e = min(d0 + timedelta(days=30), d1)
+        parts.append(_agrimet_csv("instant.pl", site, AGRIMET_CODES, d0.isoformat(), e.isoformat()))
+        d0 = e + timedelta(days=1)
+    raw = pd.concat(parts, ignore_index=True).sort_values("datetime")
+    raw = raw.rename(columns={f"{site}_{c}": col for c, col in AGRIMET_CODES.items()})
+    for col in AGRIMET_CODES.values():
+        if col not in raw:
+            raw[col] = np.nan
+    if raw["temp_f"].notna().sum() == 0:
+        raise RuntimeError(f"AgriMet station {site.upper()} has no temperature data for these dates (it may be inactive).")
+    # precip is a running season total: hourly rain = sum of positive increments (resets clip to 0)
+    raw["rain_in"] = raw["precip_cum_in"].diff().clip(lower=0)
+    # calm readings are logged as direction 0 (north); drop them so they don't skew the average direction
+    raw.loc[(raw["wind_speed_mph"] == 0) & (raw["wind_dir_deg"] == 0), "wind_dir_deg"] = np.nan
+    raw["hour"] = raw["datetime"].dt.floor("h")
+    g = raw.groupby("hour")
+    out = g[["temp_f", "dew_point_f", "rh_pct", "wind_speed_mph"]].mean().round(2)
+    out["wind_dir_deg"] = g["wind_dir_deg"].apply(vector_mean_dir)
+    out["wind_gust_mph"] = g["wind_gust_mph"].max()
+    out["rain_in"] = g["rain_in"].sum(min_count=1).round(3)
+    out["soil_temp_f"] = np.nan
+    out = out.reset_index().rename(columns={"hour": "datetime"})
+    return out, {}
+
+
+@lru_cache(maxsize=32)
+def fetch_agrimet_daily_maxmin(site, start, end):
+    df = _agrimet_csv("daily.pl", site, ["mx", "mn"], start, end)
+    df = df.rename(columns={f"{site}_mx": "max", f"{site}_mn": "min", "datetime": "day"})
+    return df.set_index("day")[["max", "min"]].sort_index()
 
 
 # ─────────────────────────── Aggregation ───────────────────────────
@@ -407,6 +480,58 @@ def degree_day_table(hourly, lower, upper, method, cutoff, biofix, end, daily_ma
     return d.reset_index()
 
 
+def target_hits(dd, targets, biofix):
+    """For each (event, DD) target: first date the cumulative total reaches it."""
+    rows = []
+    for ev, tgt in targets:
+        hit = dd[dd["Cumulative DD"] >= tgt]
+        if len(hit):
+            d = pd.Timestamp(hit["date"].iloc[0])
+            rows.append({"Event": ev, "DD target": tgt, "Date reached": d.date(),
+                         "Days after biofix": (d - pd.Timestamp(biofix)).days, "Reached": True})
+        else:
+            short = tgt - (dd["Cumulative DD"].iloc[-1] if len(dd) else 0)
+            rows.append({"Event": ev, "DD target": tgt, "Date reached": None,
+                         "Days after biofix": None, "Reached": False, "DD still needed": round(short, 1)})
+    return pd.DataFrame(rows)
+
+
+def dd_chart(dd, hits):
+    """Cumulative DD line with a dot + label where each target is reached; dashed line for targets not reached."""
+    import altair as alt
+
+    LINE, DOT, MUTED = "#2a78d6", "#eb6834", "#8a8a85"
+    base = dd[["date", "DD", "Cumulative DD"]].assign(date=pd.to_datetime(dd["date"]))
+    line = alt.Chart(base).mark_line(color=LINE, strokeWidth=2).encode(
+        x=alt.X("date:T", title=None), y=alt.Y("Cumulative DD:Q", title="Cumulative degree days"))
+    hover = alt.Chart(base).mark_circle(size=120, opacity=0).encode(
+        x="date:T", y="Cumulative DD:Q",
+        tooltip=[alt.Tooltip("date:T", title="Date"), alt.Tooltip("Cumulative DD:Q", format=",.1f"),
+                 alt.Tooltip("DD:Q", title="DD that day", format=".1f")])
+    layers = [line, hover]
+    if hits is not None and len(hits):
+        # pass Altair only clean, typed columns (mixed None/number/date columns trip its serializer)
+        got = hits[hits["Reached"]]
+        got = pd.DataFrame({"Event": got["Event"].astype(str), "DD target": got["DD target"].astype(float),
+                            "date": pd.to_datetime(got["Date reached"]),
+                            "Days after biofix": pd.to_numeric(got["Days after biofix"])})
+        miss = hits[~hits["Reached"]]
+        miss = pd.DataFrame({"Event": miss["Event"].astype(str), "DD target": miss["DD target"].astype(float),
+                             "DD still needed": pd.to_numeric(miss.get("DD still needed", pd.Series(dtype=float)))})
+        if len(got):
+            pts = alt.Chart(got).encode(x="date:T", y="DD target:Q",
+                                        tooltip=["Event", alt.Tooltip("DD target:Q", format=",.0f"),
+                                                 alt.Tooltip("date:T", title="Reached"), "Days after biofix"])
+            layers += [pts.mark_point(filled=True, size=110, color=DOT, stroke="white", strokeWidth=2, opacity=1),
+                       pts.mark_text(align="right", dx=-9, dy=-9, fontSize=12, color=MUTED).encode(text="Event")]
+        if len(miss):
+            rule = alt.Chart(miss).encode(y="DD target:Q", tooltip=["Event", "DD target", "DD still needed"])
+            layers += [rule.mark_rule(color=MUTED, strokeDash=[4, 4], strokeWidth=1),
+                       rule.mark_text(align="left", x=4, dy=-7, fontSize=12, color=MUTED)
+                           .encode(text=alt.Text("Event"))]
+    return alt.layer(*layers).properties(height=360)
+
+
 # ─────────────────────────── Streamlit UI ───────────────────────────
 
 def main():
@@ -427,7 +552,7 @@ def main():
         start = st.date_input("Start date", today - timedelta(days=30))
         end = st.date_input("End date", today - timedelta(days=1))
 
-        sources = ["Open-Meteo"] + (["Visual Crossing"] if VISUAL_CROSSING_KEY else []) + ["CIMIS station"]
+        sources = ["Open-Meteo", "CIMIS station", "AgriMet station"]
         source = st.radio("Data source", sources)
 
         station, station_label, cimis_key = None, "", CIMIS_KEY
@@ -445,6 +570,15 @@ def main():
                     station_label = labels[station]
                 except Exception as e:
                     st.error(f"Couldn't load the CIMIS station list: {e}")
+        elif source == "AgriMet station":
+            try:
+                near = nearest_stations(agrimet_stations(), lat, lon)
+                labels = {r.nbr: f"{r.nbr.upper()} {r.name} · {r.miles:.0f} mi" for r in near.itertuples()}
+                station = st.selectbox("Station (nearest to your lat/long)", list(labels), format_func=labels.get,
+                                       help="AgriMet's list includes some retired stations; they'll report no data.")
+                station_label = labels[station]
+            except Exception as e:
+                st.error(f"Couldn't load the AgriMet station list: {e}")
 
     # ── Weather section ──
     st.subheader("1 · Weather variables")
@@ -471,12 +605,18 @@ def main():
         cut_opts = ["Horizontal", "Vertical"] + ([] if method == "Average" else ["Intermediate"])
         cutoff = c4.selectbox("Cutoff", cut_opts, disabled=not has_upper)
         biofix = c5.date_input("Biofix", start, help="DD accumulate starting on this date (inclusive). Can be before the start date.")
-        target = st.number_input("Optional target DD (e.g. egg hatch, next generation) — 0 to skip", value=0.0, step=10.0)
+        st.markdown("**DD targets** (optional) — add a row per life-stage event, e.g. egg lay, egg hatch, first flight")
+        tgt_table = st.data_editor(
+            pd.DataFrame({"Event": pd.Series(dtype="str"), "DD target": pd.Series(dtype="float")}),
+            num_rows="dynamic", use_container_width=True, hide_index=True, key="dd_targets",
+            column_config={"Event": st.column_config.TextColumn("Event"),
+                           "DD target": st.column_config.NumberColumn("DD target", min_value=0, step=1, format="%.0f")})
         if not has_upper:
             upper = None
-        use_station_maxmin = source == "CIMIS station" and st.checkbox(
-            "Use the station's daily max/min for degree days (matches UC IPM)", value=True,
-            help="CIMIS daily max/min come from 1-minute readings. Unchecked = max/min of the hourly averages, which runs a bit lower.")
+        use_station_maxmin = source in STATION_SOURCES and st.checkbox(
+            "Use the station's daily max/min for degree days (matches UC IPM / USPEST)", value=True,
+            help="Station daily max/min come from the logger's full-resolution readings. "
+                 "Unchecked = max/min of the hourly averages, which runs a bit lower.")
 
     if not st.button("Fetch & calculate", type="primary"):
         st.caption("UC IPM's default is single sine with a horizontal cutoff.")
@@ -486,8 +626,8 @@ def main():
         st.error("End date is before start date.")
         return
 
-    if source == "CIMIS station" and station is None:
-        st.error("Pick a CIMIS station first (needs a valid CIMIS key).")
+    if source in STATION_SOURCES and station is None:
+        st.error("Pick a station first." + (" (CIMIS needs a valid key.)" if source == "CIMIS station" else ""))
         return
 
     fetch_start = min(start, biofix) if use_dd else start
@@ -498,12 +638,16 @@ def main():
         with st.spinner(f"Fetching hourly data from {source}…"):
             if source == "CIMIS station":
                 hourly, meta = fetch_cimis(station, fetch_start.isoformat(), fetch_end.isoformat(), cimis_key)
+            elif source == "AgriMet station":
+                hourly, meta = fetch_agrimet(station, fetch_start.isoformat(), fetch_end.isoformat())
             else:
-                fn = fetch_open_meteo if source == "Open-Meteo" else fetch_visual_crossing
-                hourly, meta = fn(round(lat, 6), round(lon, 6), fetch_start.isoformat(), fetch_end.isoformat())
+                hourly, meta = fetch_open_meteo(round(lat, 6), round(lon, 6), fetch_start.isoformat(), fetch_end.isoformat())
             station_maxmin = None
-            if use_dd and source == "CIMIS station" and use_station_maxmin:
-                station_maxmin = fetch_cimis_daily_maxmin(station, fetch_start.isoformat(), end.isoformat(), cimis_key)
+            if use_dd and source in STATION_SOURCES and use_station_maxmin:
+                if source == "CIMIS station":
+                    station_maxmin = fetch_cimis_daily_maxmin(station, fetch_start.isoformat(), end.isoformat(), cimis_key)
+                else:
+                    station_maxmin = fetch_agrimet_daily_maxmin(station, fetch_start.isoformat(), end.isoformat())
     except Exception as e:
         st.error(f"Data fetch failed: {e}")
         return
@@ -518,6 +662,9 @@ def main():
     if source == "CIMIS station":
         st.caption(f"CIMIS station {station_label}. Hours are Pacific Standard Time (no daylight saving). "
                    "Readings flagged missing or far out of range by CIMIS QC are dropped.")
+    if source == "AgriMet station":
+        st.caption(f"AgriMet station {station_label}. 15-minute readings averaged to hourly; times are local and "
+                   "follow daylight saving. AgriMet data are provisional.")
     soil = "Soil temp (°F)" in picked and SOIL_NOTE.get(source)
     if soil:
         st.caption(f"Note: {soil}.")
@@ -558,19 +705,26 @@ def main():
         total = dd["Cumulative DD"].iloc[-1] if len(dd) else 0
         up_txt = f"{upper:g}°F ({cutoff.lower()} cutoff)" if upper is not None else "none"
         st.subheader("Degree days")
-        m1, m2, m3 = st.columns(3)
+        m1, m2 = st.columns(2)
         m1.metric(f"Accumulated DD since biofix {biofix}", f"{total:,.1f}")
         m2.metric("Thresholds", f"{lower:g}°F / {up_txt.split(' ')[0]}")
-        reached = ""
-        if target > 0:
-            hit = dd[dd["Cumulative DD"] >= target]
-            reached = str(hit["date"].iloc[0]) if len(hit) else f"not yet ({total:,.0f} of {target:,.0f})"
-            m3.metric(f"Date {target:,.0f} DD reached", reached)
+        targets = []
+        for i, r in tgt_table.dropna(subset=["DD target"]).iterrows():
+            ev = str(r["Event"]).strip() if pd.notna(r["Event"]) and str(r["Event"]).strip() else f"Target {len(targets) + 1}"
+            if r["DD target"] > 0:
+                targets.append((ev, float(r["DD target"])))
+        targets.sort(key=lambda t: t[1])
+        hits = target_hits(dd, targets, biofix) if targets else None
         st.caption(f"Method: {method}; lower {lower:g}°F; upper {up_txt}. " + ("Uses the station's daily max/min." if station_maxmin is not None else "Uses each calendar day's hourly max/min."))
         incomplete = dd[dd["hours of data"] < 20]
         if len(incomplete):
             st.warning(f"{len(incomplete)} day(s) have fewer than 20 hourly readings; their max/min may be off.")
-        st.line_chart(dd.set_index("date")["Cumulative DD"])
+        st.altair_chart(dd_chart(dd, hits), use_container_width=True)
+        if hits is not None:
+            st.markdown("**Targets**")
+            show_hits = hits.drop(columns="Reached")
+            st.dataframe(show_hits, use_container_width=True, hide_index=True)
+            downloads["dd_targets"] = show_hits
         st.dataframe(dd, use_container_width=True, hide_index=True)
         downloads["degree_days"] = dd
 
@@ -587,8 +741,8 @@ def main():
         safe = "".join(ch if ch.isalnum() else "_" for ch in name)
         st.download_button("Download CSV", buf.getvalue(), f"{safe}_{start}_{end}.csv", "text/csv")
 
-    st.caption("Sources: Open-Meteo Historical Weather API (open-meteo.com) · Visual Crossing (visualcrossing.com) · "
-               "CIMIS Web API (cimis.water.ca.gov) · "
+    st.caption("Sources: Open-Meteo Historical Weather API (open-meteo.com) · "
+               "CIMIS Web API (cimis.water.ca.gov) · AgriMet, US Bureau of Reclamation (usbr.gov/pn/agrimet) · "
                "Degree-day methods per UC IPM (ipm.ucanr.edu/WEATHER/ddconcepts.html)")
 
 

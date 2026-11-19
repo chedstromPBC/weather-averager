@@ -14,7 +14,7 @@ Data sources:
 
 Deploy (Render):
   Start command: streamlit run weather_tool.py --server.port=10000 --server.address=0.0.0.0
-  requirements.txt: streamlit, requests, pandas, numpy
+  requirements.txt: streamlit, requests, pandas, numpy, altair
 """
 
 import io
@@ -29,6 +29,15 @@ import pandas as pd
 import requests
 
 CIMIS_KEY = os.getenv("CIMIS_APPKEY", "")
+
+APP_VERSION = "2.4.0"
+APP_UPDATED = "2026-11-19"
+# Changelog
+#   2.4.0  Saved settings (bookmarkable link + settings file); version shown in sidebar
+#   2.3.0  Open-Meteo fetches only selected variables; better rate-limit handling
+#   2.2.0  AgriMet stations; multiple DD targets with markers on the chart; Visual Crossing removed
+#   2.1.0  CIMIS stations (new 2026 CIMIS Web API)
+#   2.0.0  Combined weather + degree-day tool
 
 # Variables the user can pick: label -> (column name, how to aggregate)
 VARIABLES = {
@@ -541,26 +550,176 @@ def dd_chart(dd, hits):
 
 # ─────────────────────────── Streamlit UI ───────────────────────────
 
+# ─────────────────────────── Saved settings ───────────────────────────
+# Every input lives in st.session_state under one of these keys. The same dict is
+# mirrored into the page URL (bookmark it) and can be saved/loaded as a JSON file.
+
+SOURCES = ["Open-Meteo", "CIMIS station", "AgriMet station"]
+COL_TO_LABEL = {col: label for label, (col, _) in VARIABLES.items()}
+
+
+def default_settings():
+    today = date.today()
+    return {
+        "name": "Site 1", "lat": 39.090431, "lon": -121.423245,
+        "start": today - timedelta(days=30), "end": today - timedelta(days=1),
+        "source": "Open-Meteo", "station": "",
+        "vars": ["Air temperature (°F)", "Wind speed (mph)", "Wind direction"],
+        "output": "Daily values", "use_window": False, "sh": 22, "eh": 5,
+        "use_dd": True, "lower": 55.0, "has_upper": True, "upper": 94.0,
+        "method": "Single sine", "cutoff": "Horizontal", "biofix": today - timedelta(days=30),
+        "station_maxmin": True, "targets": [],
+    }
+
+
+def settings_to_flat(st_):
+    """Current settings as plain strings (for the URL and the JSON file)."""
+    ss = st_.session_state["cfg"]
+    out = {
+        "name": ss["name"], "lat": f"{ss['lat']:.6f}", "lon": f"{ss['lon']:.6f}",
+        "start": ss["start"].isoformat(), "end": ss["end"].isoformat(),
+        "source": ss["source"], "station": str(ss.get("station") or ""),
+        "vars": ",".join(VARIABLES[v][0] for v in ss["vars"]),
+        "output": ss["output"], "window": f"{int(ss['use_window'])}:{ss['sh']}-{ss['eh']}",
+        "dd": int(ss["use_dd"]), "lower": f"{ss['lower']:g}",
+        "upper": f"{ss['upper']:g}" if ss["has_upper"] else "none",
+        "method": ss["method"], "cutoff": ss["cutoff"], "biofix": ss["biofix"].isoformat(),
+        "stnmm": int(ss["station_maxmin"]),
+        "targets": "|".join(f"{ev}~{t:g}" for ev, t in st_.session_state.get("targets_saved", [])),
+    }
+    return {k: str(v) for k, v in out.items()}
+
+
+def flat_to_settings(flat):
+    """Parse URL/JSON values over the defaults; anything missing or malformed keeps its default."""
+    s = default_settings()
+
+    def get(k, conv):
+        try:
+            if k in flat and str(flat[k]) != "":
+                return conv(str(flat[k]))
+        except (ValueError, TypeError):
+            pass
+        return None
+
+    for k, conv in (("name", str), ("lat", float), ("lon", float), ("lower", float),
+                    ("start", date.fromisoformat), ("end", date.fromisoformat), ("biofix", date.fromisoformat)):
+        v = get(k, conv)
+        if v is not None:
+            s[k] = v
+    if flat.get("source") in SOURCES:
+        s["source"] = flat["source"]
+    s["station"] = str(flat.get("station", "") or "")
+    if "vars" in flat:
+        s["vars"] = [COL_TO_LABEL[c] for c in str(flat["vars"]).split(",") if c in COL_TO_LABEL]
+    if flat.get("output") in ("Daily values", "Whole-period summary", "Both"):
+        s["output"] = flat["output"]
+    w = get("window", lambda x: (bool(int(x.split(":")[0])), *map(int, x.split(":")[1].split("-"))))
+    if w and all(0 <= h <= 23 for h in w[1:]):
+        s["use_window"], s["sh"], s["eh"] = w
+    d = get("dd", int)
+    if d is not None:
+        s["use_dd"] = bool(d)
+    if str(flat.get("upper", "")) == "none":
+        s["has_upper"] = False
+    else:
+        u = get("upper", float)
+        if u is not None:
+            s["upper"], s["has_upper"] = u, True
+    if flat.get("method") in ("Single sine", "Single triangle", "Average"):
+        s["method"] = flat["method"]
+    if flat.get("cutoff") in ("Horizontal", "Vertical", "Intermediate"):
+        s["cutoff"] = flat["cutoff"]
+    m = get("stnmm", int)
+    if m is not None:
+        s["station_maxmin"] = bool(m)
+    tg = []
+    for part in str(flat.get("targets", "") or "").split("|"):
+        if "~" in part:
+            ev, _, t = part.rpartition("~")
+            try:
+                tg.append((ev, float(t)))
+            except ValueError:
+                pass
+    s["targets"] = tg
+    return s
+
+
+def apply_settings(st_, s):
+    """Make s the current settings. Widget keys are cleared so every input redraws from cfg."""
+    ss = st_.session_state
+    ss["cfg"] = {k: v for k, v in s.items() if k != "targets"}
+    for k in [k for k in ss.keys() if str(k).startswith("w_")]:
+        del ss[k]
+    ss["targets_saved"] = list(s["targets"])
+    ss["targets_df"] = pd.DataFrame({"Event": [e for e, _ in s["targets"]],
+                                     "DD target": [t for _, t in s["targets"]]}).astype({"Event": "str", "DD target": "float"})
+    ss["targets_ver"] = ss.get("targets_ver", 0) + 1   # fresh editor so loaded rows show up
+
+
+def wkey(st_, k):
+    """Widget key for setting k. Values live in session_state['cfg'] (which Streamlit never clears);
+    the widget's own key is re-seeded from cfg whenever the widget was hidden and comes back."""
+    ss = st_.session_state
+    if "w_" + k not in ss:
+        ss["w_" + k] = ss["cfg"][k]
+    return "w_" + k
+
+
+def keep_valid(st_, k, options):
+    """A saved value that isn't offered any more (e.g. a station list changed) falls back to the first option."""
+    ss = st_.session_state
+    if ss.get("w_" + k, ss["cfg"].get(k)) not in options:
+        ss["cfg"][k] = options[0]
+        ss["w_" + k] = options[0]
+
+
+def sync_cfg(st_):
+    ss = st_.session_state
+    for k in ss["cfg"]:
+        if "w_" + k in ss:
+            ss["cfg"][k] = ss["w_" + k]
+
+
 def main():
     import streamlit as st
 
     st.set_page_config(page_title="Weather & Degree-Day Tool", layout="wide")
     st.title("Weather & Degree-Day Tool")
+    ss = st.session_state
+
+    # First load: settings come from the link (if any) over the defaults
+    if "_init" not in ss:
+        apply_settings(st, flat_to_settings(dict(st.query_params)))
+        ss["_init"] = True
 
     with st.sidebar:
+        with st.expander("Saved settings"):
+            st.caption("The page address updates as you change inputs — bookmark it to reopen this exact query. "
+                       "Or save the settings as a file and load it later.")
+            up = st.file_uploader("Load a settings file", type="json", label_visibility="collapsed")
+            if up is not None and ss.get("_loaded_file") != up.file_id:
+                import json
+                try:
+                    apply_settings(st, flat_to_settings(json.loads(up.getvalue().decode("utf-8"))))
+                    ss["_loaded_file"] = up.file_id
+                    st.rerun()
+                except ValueError:
+                    st.error("That file isn't a settings file from this app.")
+            settings_slot = st.empty()  # the download button is drawn after the inputs below
+
         st.header("Location")
-        name = st.text_input("Location name", "Site 1")
+        st.text_input("Location name", key=wkey(st, "name"))
         c1, c2 = st.columns(2)
-        lat = c1.number_input("Latitude", value=39.090431, format="%.6f")
-        lon = c2.number_input("Longitude", value=-121.423245, format="%.6f")
+        c1.number_input("Latitude", format="%.6f", key=wkey(st, "lat"))
+        c2.number_input("Longitude", format="%.6f", key=wkey(st, "lon"))
+        name, lat, lon = ss["w_name"], ss["w_lat"], ss["w_lon"]
 
         st.header("Dates")
-        today = date.today()
-        start = st.date_input("Start date", today - timedelta(days=30))
-        end = st.date_input("End date", today - timedelta(days=1))
+        start = st.date_input("Start date", key=wkey(st, "start"))
+        end = st.date_input("End date", key=wkey(st, "end"))
 
-        sources = ["Open-Meteo", "CIMIS station", "AgriMet station"]
-        source = st.radio("Data source", sources)
+        source = st.radio("Data source", SOURCES, key=wkey(st, "source"))
 
         station, station_label, cimis_key = None, "", CIMIS_KEY
         if source == "CIMIS station":
@@ -570,18 +729,21 @@ def main():
             if cimis_key:
                 try:
                     near = nearest_stations(cimis_stations(cimis_key), lat, lon)
-                    labels = {int(r.nbr): f"#{r.nbr} {r.name} ({r.county}) · {r.miles:.0f} mi"
+                    labels = {str(r.nbr): f"#{r.nbr} {r.name} ({r.county}) · {r.miles:.0f} mi"
                               for r in near.itertuples()}
+                    keep_valid(st, "station", list(labels))
                     station = st.selectbox("Station (nearest active to your lat/long)", list(labels),
-                                           format_func=labels.get)
-                    station_label = labels[station]
+                                           format_func=labels.get, key=wkey(st, "station"))
+                    station_label, station = labels[station], int(station)
                 except Exception as e:
                     st.error(f"Couldn't load the CIMIS station list: {e}")
         elif source == "AgriMet station":
             try:
                 near = nearest_stations(agrimet_stations(), lat, lon)
                 labels = {r.nbr: f"{r.nbr.upper()} {r.name} · {r.miles:.0f} mi" for r in near.itertuples()}
+                keep_valid(st, "station", list(labels))
                 station = st.selectbox("Station (nearest to your lat/long)", list(labels), format_func=labels.get,
+                                       key=wkey(st, "station"),
                                        help="AgriMet's list includes some retired stations; they'll report no data.")
                 station_label = labels[station]
             except Exception as e:
@@ -590,40 +752,64 @@ def main():
     # ── Weather section ──
     st.subheader("1 · Weather variables")
     avail = [v for v in VARIABLES if v not in NOT_AVAILABLE[source]]
-    picked = st.multiselect("Variables", avail, default=["Air temperature (°F)", "Wind speed (mph)", "Wind direction"])
+    vk = wkey(st, "vars")
+    ss[vk] = [v for v in ss[vk] if v in avail]
+    picked = st.multiselect("Variables", avail, key=wkey(st, "vars"))
 
     c1, c2, c3 = st.columns([1.2, 1, 1])
-    output_mode = c1.radio("Output", ["Daily values", "Whole-period summary", "Both"], horizontal=False)
-    use_window = c2.checkbox("Limit to an hour window", value=False,
+    output_mode = c1.radio("Output", ["Daily values", "Whole-period summary", "Both"], key=wkey(st, "output"))
+    use_window = c2.checkbox("Limit to an hour window", key=wkey(st, "use_window"),
                              help="E.g. 10 PM–5 AM for nighttime averages. Windows that cross midnight are labeled by the starting evening.")
     hours = list(range(24))
-    sh = c2.selectbox("From", hours, index=22, format_func=fmt_hour, disabled=not use_window)
-    eh = c3.selectbox("To (inclusive)", hours, index=5, format_func=fmt_hour, disabled=not use_window)
+    sh = c2.selectbox("From", hours, format_func=fmt_hour, disabled=not use_window, key=wkey(st, "sh"))
+    eh = c3.selectbox("To (inclusive)", hours, format_func=fmt_hour, disabled=not use_window, key=wkey(st, "eh"))
 
     # ── Degree-day section ──
     st.subheader("2 · Degree days")
-    use_dd = st.checkbox("Calculate degree days", value=True)
+    use_dd = st.checkbox("Calculate degree days", key=wkey(st, "use_dd"))
     if use_dd:
         c1, c2, c3, c4, c5 = st.columns(5)
-        lower = c1.number_input("Lower threshold (°F)", value=55.0, step=0.5)
-        has_upper = c2.checkbox("Use upper threshold", value=True)
-        upper = c2.number_input("Upper threshold (°F)", value=94.0, step=0.5, disabled=not has_upper)
-        method = c3.selectbox("Method", ["Single sine", "Single triangle", "Average"])
+        lower = c1.number_input("Lower threshold (°F)", step=0.5, key=wkey(st, "lower"))
+        has_upper = c2.checkbox("Use upper threshold", key=wkey(st, "has_upper"))
+        upper = c2.number_input("Upper threshold (°F)", step=0.5, disabled=not has_upper, key=wkey(st, "upper"))
+        method = c3.selectbox("Method", ["Single sine", "Single triangle", "Average"], key=wkey(st, "method"))
         cut_opts = ["Horizontal", "Vertical"] + ([] if method == "Average" else ["Intermediate"])
-        cutoff = c4.selectbox("Cutoff", cut_opts, disabled=not has_upper)
-        biofix = c5.date_input("Biofix", start, help="DD accumulate starting on this date (inclusive). Can be before the start date.")
+        keep_valid(st, "cutoff", cut_opts)
+        cutoff = c4.selectbox("Cutoff", cut_opts, disabled=not has_upper, key=wkey(st, "cutoff"))
+        biofix = c5.date_input("Biofix", key=wkey(st, "biofix"),
+                               help="DD accumulate starting on this date (inclusive). Can be before the start date.")
         st.markdown("**DD targets** (optional) — add a row per life-stage event, e.g. egg lay, egg hatch, first flight")
         tgt_table = st.data_editor(
-            pd.DataFrame({"Event": pd.Series(dtype="str"), "DD target": pd.Series(dtype="float")}),
-            num_rows="dynamic", use_container_width=True, hide_index=True, key="dd_targets",
+            ss["targets_df"], num_rows="dynamic", use_container_width=True, hide_index=True,
+            key=f"dd_targets_{ss['targets_ver']}",
             column_config={"Event": st.column_config.TextColumn("Event"),
                            "DD target": st.column_config.NumberColumn("DD target", min_value=0, step=1, format="%.0f")})
+        targets = []
+        for _, r in tgt_table.dropna(subset=["DD target"]).iterrows():
+            ev = str(r["Event"]).strip() if pd.notna(r["Event"]) and str(r["Event"]).strip() else f"Target {len(targets) + 1}"
+            if r["DD target"] > 0:
+                targets.append((ev, float(r["DD target"])))
+        targets.sort(key=lambda t: t[1])
+        ss["targets_saved"] = targets
         if not has_upper:
             upper = None
         use_station_maxmin = source in STATION_SOURCES and st.checkbox(
-            "Use the station's daily max/min for degree days (matches UC IPM / USPEST)", value=True,
+            "Use the station's daily max/min for degree days (matches UC IPM / USPEST)", key=wkey(st, "station_maxmin"),
             help="Station daily max/min come from the logger's full-resolution readings. "
                  "Unchecked = max/min of the hourly averages, which runs a bit lower.")
+
+    # Save: mirror settings into the URL and offer them as a file
+    sync_cfg(st)
+    flat = settings_to_flat(st)
+    try:
+        st.query_params.from_dict(flat)
+    except Exception:
+        pass  # very long settings can exceed URL limits; the file still works
+    import json
+    safe = "".join(ch if ch.isalnum() else "_" for ch in name) or "settings"
+    settings_slot.download_button("Save settings to a file", json.dumps(flat, indent=1),
+                                  f"{safe}_settings.json", "application/json", use_container_width=True)
+    st.sidebar.caption(f"Version {APP_VERSION} · updated {APP_UPDATED}")
 
     if not st.button("Fetch & calculate", type="primary"):
         st.caption("UC IPM's default is single sine with a horizontal cutoff.")
@@ -719,12 +905,6 @@ def main():
         m1, m2 = st.columns(2)
         m1.metric(f"Accumulated DD since biofix {biofix}", f"{total:,.1f}")
         m2.metric("Thresholds", f"{lower:g}°F / {up_txt.split(' ')[0]}")
-        targets = []
-        for i, r in tgt_table.dropna(subset=["DD target"]).iterrows():
-            ev = str(r["Event"]).strip() if pd.notna(r["Event"]) and str(r["Event"]).strip() else f"Target {len(targets) + 1}"
-            if r["DD target"] > 0:
-                targets.append((ev, float(r["DD target"])))
-        targets.sort(key=lambda t: t[1])
         hits = target_hits(dd, targets, biofix) if targets else None
         st.caption(f"Method: {method}; lower {lower:g}°F; upper {up_txt}. " + ("Uses the station's daily max/min." if station_maxmin is not None else "Uses each calendar day's hourly max/min."))
         incomplete = dd[dd["hours of data"] < 20]

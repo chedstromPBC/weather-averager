@@ -30,9 +30,10 @@ import requests
 
 CIMIS_KEY = os.getenv("CIMIS_APPKEY", "")
 
-APP_VERSION = "2.4.0"
+APP_VERSION = "2.5.0"
 APP_UPDATED = "2026-11-19"
 # Changelog
+#   2.5.0  Imperial / Metric toggle (display, inputs, DD, CSV); saved with settings
 #   2.4.0  Saved settings (bookmarkable link + settings file); version shown in sidebar
 #   2.3.0  Open-Meteo fetches only selected variables; better rate-limit handling
 #   2.2.0  AgriMet stations; multiple DD targets with markers on the chart; Visual Crossing removed
@@ -57,6 +58,63 @@ NOT_AVAILABLE = {
     "AgriMet station": {"Soil temp (°F)"},
 }
 STATION_SOURCES = ("CIMIS station", "AgriMet station")
+
+# ─────────────────────────── Units ───────────────────────────
+# Everything is fetched and stored in imperial. With Metric on, the hourly data is
+# converted once right after fetching, and DD thresholds/targets are entered in °C,
+# so degree days come out in °C-days (= °F-days × 5/9).
+UNIT_SYSTEMS = ["Imperial", "Metric"]
+TEMP_COLS = ("temp_f", "dew_point_f", "soil_temp_f")
+SPEED_COLS = ("wind_speed_mph", "wind_gust_mph")
+RAIN_COLS = ("rain_in",)
+METRIC_LABELS = {
+    "Air temperature (°F)": "Air temperature (°C)",
+    "Wind speed (mph)": "Wind speed (km/h)",
+    "Wind gust (mph)": "Wind gust (km/h)",
+    "Rainfall (in)": "Rainfall (mm)",
+    "Dew point (°F)": "Dew point (°C)",
+    "Soil temp (°F)": "Soil temp (°C)",
+    "Max temp (°F)": "Max temp (°C)",
+    "Min temp (°F)": "Min temp (°C)",
+    "DD max temp (°F)": "DD max temp (°C)",
+    "DD min temp (°F)": "DD min temp (°C)",
+}
+
+
+def f_to_c(f):
+    return (f - 32) * 5 / 9
+
+
+def c_to_f(c):
+    return c * 9 / 5 + 32
+
+
+def lbl(label, metric):
+    """Display label for the chosen unit system (internal labels are imperial)."""
+    return METRIC_LABELS.get(label, label) if metric else label
+
+
+def relabel(df, metric):
+    return df.rename(columns=METRIC_LABELS) if metric else df
+
+
+def hourly_to_metric(df):
+    """°F → °C, mph → km/h, in → mm. Returns a copy (fetch results are cached and shared)."""
+    df = df.copy()
+    for c in TEMP_COLS:
+        if c in df:
+            df[c] = f_to_c(df[c])
+    for c in SPEED_COLS:
+        if c in df:
+            df[c] = df[c] * 1.609344
+    for c in RAIN_COLS:
+        if c in df:
+            df[c] = df[c] * 25.4
+    return df
+
+
+def dist_txt(miles, metric):
+    return f"{miles * 1.609344:.0f} km" if metric else f"{miles:.0f} mi"
 SOIL_NOTE = {
     "Open-Meteo": "soil temp is modeled 0–7 cm (0 cm for the last few days)",
     "CIMIS station": "soil temp is measured at 15 cm under irrigated grass",
@@ -512,14 +570,14 @@ def target_hits(dd, targets, biofix):
     return pd.DataFrame(rows)
 
 
-def dd_chart(dd, hits):
+def dd_chart(dd, hits, y_title="Cumulative degree days"):
     """Cumulative DD line with a dot + label where each target is reached; dashed line for targets not reached."""
     import altair as alt
 
     LINE, DOT, MUTED = "#2a78d6", "#eb6834", "#8a8a85"
     base = dd[["date", "DD", "Cumulative DD"]].assign(date=pd.to_datetime(dd["date"]))
     line = alt.Chart(base).mark_line(color=LINE, strokeWidth=2).encode(
-        x=alt.X("date:T", title=None), y=alt.Y("Cumulative DD:Q", title="Cumulative degree days"))
+        x=alt.X("date:T", title=None), y=alt.Y("Cumulative DD:Q", title=y_title))
     hover = alt.Chart(base).mark_circle(size=120, opacity=0).encode(
         x="date:T", y="Cumulative DD:Q",
         tooltip=[alt.Tooltip("date:T", title="Date"), alt.Tooltip("Cumulative DD:Q", format=",.1f"),
@@ -568,7 +626,7 @@ def default_settings():
         "output": "Daily values", "use_window": False, "sh": 22, "eh": 5,
         "use_dd": True, "lower": 55.0, "has_upper": True, "upper": 94.0,
         "method": "Single sine", "cutoff": "Horizontal", "biofix": today - timedelta(days=30),
-        "station_maxmin": True, "targets": [],
+        "station_maxmin": True, "targets": [], "units": "Imperial",
     }
 
 
@@ -584,7 +642,7 @@ def settings_to_flat(st_):
         "dd": int(ss["use_dd"]), "lower": f"{ss['lower']:g}",
         "upper": f"{ss['upper']:g}" if ss["has_upper"] else "none",
         "method": ss["method"], "cutoff": ss["cutoff"], "biofix": ss["biofix"].isoformat(),
-        "stnmm": int(ss["station_maxmin"]),
+        "stnmm": int(ss["station_maxmin"]), "units": ss["units"],
         "targets": "|".join(f"{ev}~{t:g}" for ev, t in st_.session_state.get("targets_saved", [])),
     }
     return {k: str(v) for k, v in out.items()}
@@ -630,6 +688,8 @@ def flat_to_settings(flat):
         s["method"] = flat["method"]
     if flat.get("cutoff") in ("Horizontal", "Vertical", "Intermediate"):
         s["cutoff"] = flat["cutoff"]
+    if flat.get("units") in UNIT_SYSTEMS:
+        s["units"] = flat["units"]
     m = get("stnmm", int)
     if m is not None:
         s["station_maxmin"] = bool(m)
@@ -681,6 +741,27 @@ def sync_cfg(st_):
             ss["cfg"][k] = ss["w_" + k]
 
 
+def convert_units_on_toggle(st_):
+    """When the unit toggle flips, convert the DD thresholds and targets so they mean the same thing."""
+    ss = st_.session_state
+    new, old = ss["w_units"], ss["cfg"]["units"]
+    if new == old:
+        return
+    to_metric = new == "Metric"
+    for k in ("lower", "upper"):
+        v = ss.get("w_" + k, ss["cfg"][k])
+        v = round(f_to_c(v), 2) if to_metric else round(c_to_f(v), 1)
+        ss["cfg"][k] = v
+        ss["w_" + k] = v
+    scale = 5 / 9 if to_metric else 9 / 5
+    targets = [(ev, round(t * scale, 1)) for ev, t in ss.get("targets_saved", [])]
+    ss["targets_saved"] = targets
+    ss["targets_df"] = pd.DataFrame({"Event": [e for e, _ in targets],
+                                     "DD target": [t for _, t in targets]}).astype({"Event": "str", "DD target": "float"})
+    ss["targets_ver"] = ss.get("targets_ver", 0) + 1
+    ss["cfg"]["units"] = new
+
+
 def main():
     import streamlit as st
 
@@ -708,6 +789,12 @@ def main():
                     st.error("That file isn't a settings file from this app.")
             settings_slot = st.empty()  # the download button is drawn after the inputs below
 
+        st.radio("Units", UNIT_SYSTEMS, horizontal=True, key=wkey(st, "units"),
+                 on_change=convert_units_on_toggle, args=(st,),
+                 help="Metric: °C, km/h, mm, and °C degree days. Your DD thresholds and targets convert automatically.")
+        metric = ss["w_units"] == "Metric"
+        u = "°C" if metric else "°F"
+
         st.header("Location")
         st.text_input("Location name", key=wkey(st, "name"))
         c1, c2 = st.columns(2)
@@ -729,7 +816,7 @@ def main():
             if cimis_key:
                 try:
                     near = nearest_stations(cimis_stations(cimis_key), lat, lon)
-                    labels = {str(r.nbr): f"#{r.nbr} {r.name} ({r.county}) · {r.miles:.0f} mi"
+                    labels = {str(r.nbr): f"#{r.nbr} {r.name} ({r.county}) · {dist_txt(r.miles, metric)}"
                               for r in near.itertuples()}
                     keep_valid(st, "station", list(labels))
                     station = st.selectbox("Station (nearest active to your lat/long)", list(labels),
@@ -740,7 +827,7 @@ def main():
         elif source == "AgriMet station":
             try:
                 near = nearest_stations(agrimet_stations(), lat, lon)
-                labels = {r.nbr: f"{r.nbr.upper()} {r.name} · {r.miles:.0f} mi" for r in near.itertuples()}
+                labels = {r.nbr: f"{r.nbr.upper()} {r.name} · {dist_txt(r.miles, metric)}" for r in near.itertuples()}
                 keep_valid(st, "station", list(labels))
                 station = st.selectbox("Station (nearest to your lat/long)", list(labels), format_func=labels.get,
                                        key=wkey(st, "station"),
@@ -754,7 +841,7 @@ def main():
     avail = [v for v in VARIABLES if v not in NOT_AVAILABLE[source]]
     vk = wkey(st, "vars")
     ss[vk] = [v for v in ss[vk] if v in avail]
-    picked = st.multiselect("Variables", avail, key=wkey(st, "vars"))
+    picked = st.multiselect("Variables", avail, format_func=lambda v: lbl(v, metric), key=wkey(st, "vars"))
 
     c1, c2, c3 = st.columns([1.2, 1, 1])
     output_mode = c1.radio("Output", ["Daily values", "Whole-period summary", "Both"], key=wkey(st, "output"))
@@ -769,21 +856,21 @@ def main():
     use_dd = st.checkbox("Calculate degree days", key=wkey(st, "use_dd"))
     if use_dd:
         c1, c2, c3, c4, c5 = st.columns(5)
-        lower = c1.number_input("Lower threshold (°F)", step=0.5, key=wkey(st, "lower"))
+        lower = c1.number_input(f"Lower threshold ({u})", step=0.5, key=wkey(st, "lower"))
         has_upper = c2.checkbox("Use upper threshold", key=wkey(st, "has_upper"))
-        upper = c2.number_input("Upper threshold (°F)", step=0.5, disabled=not has_upper, key=wkey(st, "upper"))
+        upper = c2.number_input(f"Upper threshold ({u})", step=0.5, disabled=not has_upper, key=wkey(st, "upper"))
         method = c3.selectbox("Method", ["Single sine", "Single triangle", "Average"], key=wkey(st, "method"))
         cut_opts = ["Horizontal", "Vertical"] + ([] if method == "Average" else ["Intermediate"])
         keep_valid(st, "cutoff", cut_opts)
         cutoff = c4.selectbox("Cutoff", cut_opts, disabled=not has_upper, key=wkey(st, "cutoff"))
         biofix = c5.date_input("Biofix", key=wkey(st, "biofix"),
                                help="DD accumulate starting on this date (inclusive). Can be before the start date.")
-        st.markdown("**DD targets** (optional) — add a row per life-stage event, e.g. egg lay, egg hatch, first flight")
+        st.markdown(f"**DD targets** ({u}-days, optional) — add a row per life-stage event, e.g. egg lay, egg hatch, first flight")
         tgt_table = st.data_editor(
             ss["targets_df"], num_rows="dynamic", use_container_width=True, hide_index=True,
             key=f"dd_targets_{ss['targets_ver']}",
             column_config={"Event": st.column_config.TextColumn("Event"),
-                           "DD target": st.column_config.NumberColumn("DD target", min_value=0, step=1, format="%.0f")})
+                           "DD target": st.column_config.NumberColumn(f"DD target ({u}-days)", min_value=0, step=0.1, format="%.1f")})
         targets = []
         for _, r in tgt_table.dropna(subset=["DD target"]).iterrows():
             ev = str(r["Event"]).strip() if pd.notna(r["Event"]) and str(r["Event"]).strip() else f"Target {len(targets) + 1}"
@@ -849,6 +936,10 @@ def main():
     if hourly.empty:
         st.error("No data returned for that location/date range.")
         return
+    if metric:
+        hourly = hourly_to_metric(hourly)
+        if station_maxmin is not None:
+            station_maxmin = f_to_c(station_maxmin)
 
     if meta.get("warning"):
         st.warning(meta["warning"])
@@ -878,7 +969,7 @@ def main():
         win_label = f"{fmt_hour(sh)}–{fmt_hour(eh)}" if use_window else "all hours"
         if output_mode in ("Whole-period summary", "Both"):
             st.subheader(f"Period summary · {start} to {end} · {win_label}")
-            summ = aggregate(w, cols)
+            summ = relabel(aggregate(w, cols), metric)
             show = [c for c in summ.columns if c != "hours"]
             mcols = st.columns(min(len(show), 5))
             for i, c in enumerate(show):
@@ -888,29 +979,30 @@ def main():
             downloads["summary"] = summ
         if output_mode in ("Daily values", "Both"):
             st.subheader(f"Daily values · {win_label}")
-            daily = aggregate(w, cols, "period")
+            daily = relabel(aggregate(w, cols, "period"), metric)
             daily["date"] = pd.to_datetime(daily["date"]).dt.date
             st.dataframe(daily, use_container_width=True, hide_index=True)
             if "Air temperature (°F)" in cols:
-                st.line_chart(daily.set_index("date")[["Air temperature (°F)", "Max temp (°F)", "Min temp (°F)"]])
+                st.line_chart(daily.set_index("date")[[lbl(c, metric) for c in
+                                                       ("Air temperature (°F)", "Max temp (°F)", "Min temp (°F)")]])
             downloads["daily"] = daily
 
     # Degree-day results
     if use_dd:
-        dd = degree_day_table(hourly, lower, upper, method, cutoff, biofix, end, station_maxmin)
+        dd = relabel(degree_day_table(hourly, lower, upper, method, cutoff, biofix, end, station_maxmin), metric)
         dd["date"] = pd.to_datetime(dd["date"]).dt.date
         total = dd["Cumulative DD"].iloc[-1] if len(dd) else 0
-        up_txt = f"{upper:g}°F ({cutoff.lower()} cutoff)" if upper is not None else "none"
+        up_txt = f"{upper:g}{u} ({cutoff.lower()} cutoff)" if upper is not None else "none"
         st.subheader("Degree days")
         m1, m2 = st.columns(2)
-        m1.metric(f"Accumulated DD since biofix {biofix}", f"{total:,.1f}")
-        m2.metric("Thresholds", f"{lower:g}°F / {up_txt.split(' ')[0]}")
+        m1.metric(f"Accumulated DD ({u}-days) since biofix {biofix}", f"{total:,.1f}")
+        m2.metric("Thresholds", f"{lower:g}{u} / {up_txt.split(' ')[0]}")
         hits = target_hits(dd, targets, biofix) if targets else None
-        st.caption(f"Method: {method}; lower {lower:g}°F; upper {up_txt}. " + ("Uses the station's daily max/min." if station_maxmin is not None else "Uses each calendar day's hourly max/min."))
+        st.caption(f"Method: {method}; lower {lower:g}{u}; upper {up_txt}. " + ("Uses the station's daily max/min." if station_maxmin is not None else "Uses each calendar day's hourly max/min."))
         incomplete = dd[dd["hours of data"] < 20]
         if len(incomplete):
             st.warning(f"{len(incomplete)} day(s) have fewer than 20 hourly readings; their max/min may be off.")
-        st.altair_chart(dd_chart(dd, hits), use_container_width=True)
+        st.altair_chart(dd_chart(dd, hits, f"Cumulative degree days ({u}-days)"), use_container_width=True)
         if hits is not None:
             st.markdown("**Targets**")
             show_hits = hits.drop(columns="Reached")
@@ -923,9 +1015,9 @@ def main():
     if downloads:
         buf = io.StringIO()
         src_txt = f"{source} {station_label}" if station_label else source
-        buf.write(f"# {name} ({lat}, {lon}) | source: {src_txt} | {start} to {end}\n")
+        buf.write(f"# {name} ({lat}, {lon}) | source: {src_txt} | {start} to {end} | units: {ss['w_units'].lower()}\n")
         if use_dd:
-            buf.write(f"# Degree days: {method}, lower {lower:g}F, upper {up_txt}, biofix {biofix}\n")
+            buf.write(f"# Degree days ({u}-days): {method}, lower {lower:g}{u}, upper {up_txt}, biofix {biofix}\n")
         for k, df in downloads.items():
             buf.write(f"\n# {k}\n")
             df.to_csv(buf, index=False)

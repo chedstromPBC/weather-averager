@@ -63,7 +63,7 @@ def _get_json(url, params, tries=4, retry_429=True):
     for i in range(tries):
         r = requests.get(url, params=params, timeout=60)
         if r.status_code == 429 and retry_429 and i < tries - 1:
-            time.sleep(2 * (i + 1) ** 2)
+            time.sleep(min(int(r.headers.get("Retry-After", 0) or 0) or 10 * (i + 1), 30))  # ~60 s total
             continue
         if r.status_code == 429:
             raise RuntimeError(f"{host} says too many requests (HTTP 429). "
@@ -86,8 +86,10 @@ OM_HOURLY = {
 
 
 @lru_cache(maxsize=64)
-def fetch_open_meteo(lat, lon, start, end):
-    """Hourly data, local time. Archive (ERA5) for older dates, forecast API for the last few days."""
+def fetch_open_meteo(lat, lon, start, end, columns=tuple(OM_HOURLY.values())):
+    """Hourly data, local time. Archive (ERA5) for older dates, forecast API for the last few days.
+    Only the requested columns are fetched: Open-Meteo bills a request as
+    (days / 14) × (variables / 10) calls, so fewer variables = far fewer calls."""
     common = {
         "latitude": lat, "longitude": lon, "timezone": "auto",
         "temperature_unit": "fahrenheit", "wind_speed_unit": "mph", "precipitation_unit": "inch",
@@ -95,22 +97,27 @@ def fetch_open_meteo(lat, lon, start, end):
     start_d, end_d = date.fromisoformat(start), date.fromisoformat(end)
     archive_end = min(end_d, date.today() - timedelta(days=6))
     frames, meta = [], {}
+    wanted = [api for api, col in OM_HOURLY.items() if col in columns] or ["temperature_2m"]
 
     if start_d <= archive_end:
-        p = dict(common, start_date=start, end_date=archive_end.isoformat(),
-                 hourly=",".join(OM_HOURLY))
+        p = dict(common, start_date=start, end_date=archive_end.isoformat(), hourly=",".join(wanted))
         j = _get_json("https://archive-api.open-meteo.com/v1/archive", p)
         frames.append(_om_frame(j))
         meta = {"grid_lat": j.get("latitude"), "grid_lon": j.get("longitude"), "elev_m": j.get("elevation")}
 
     recent_start = max(start_d, archive_end + timedelta(days=1))
     if recent_start <= end_d:
-        hourly = ",".join(OM_HOURLY).replace("soil_temperature_0_to_7cm", "soil_temperature_0cm")
+        hourly = ",".join(wanted).replace("soil_temperature_0_to_7cm", "soil_temperature_0cm")
         p = dict(common, start_date=recent_start.isoformat(), end_date=end, hourly=hourly)
-        j = _get_json("https://api.open-meteo.com/v1/forecast", p)
-        f = _om_frame(j)
-        frames.append(f)
-        meta = meta or {"grid_lat": j.get("latitude"), "grid_lon": j.get("longitude"), "elev_m": j.get("elevation")}
+        try:
+            j = _get_json("https://api.open-meteo.com/v1/forecast", p)
+            frames.append(_om_frame(j))
+            meta = meta or {"grid_lat": j.get("latitude"), "grid_lon": j.get("longitude"), "elev_m": j.get("elevation")}
+        except RuntimeError as e:
+            if not frames:          # nothing else to show
+                raise
+            meta = dict(meta, warning=f"The last {(end_d - recent_start).days + 1} day(s) couldn't be fetched "
+                                      f"({e}) — results stop at {archive_end}.")
 
     df = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
     return df, meta
@@ -641,7 +648,9 @@ def main():
             elif source == "AgriMet station":
                 hourly, meta = fetch_agrimet(station, fetch_start.isoformat(), fetch_end.isoformat())
             else:
-                hourly, meta = fetch_open_meteo(round(lat, 6), round(lon, 6), fetch_start.isoformat(), fetch_end.isoformat())
+                need = {VARIABLES[v][0] for v in picked} | ({"temp_f"} if use_dd else set())
+                hourly, meta = fetch_open_meteo(round(lat, 6), round(lon, 6), fetch_start.isoformat(),
+                                                fetch_end.isoformat(), tuple(sorted(need)))
             station_maxmin = None
             if use_dd and source in STATION_SOURCES and use_station_maxmin:
                 if source == "CIMIS station":
@@ -655,6 +664,8 @@ def main():
         st.error("No data returned for that location/date range.")
         return
 
+    if meta.get("warning"):
+        st.warning(meta["warning"])
     if meta.get("grid_lat") is not None:
         elev = f", elevation {meta['elev_m']:.0f} m" if meta.get("elev_m") is not None else ""
         st.caption(f"{source} data point used: {meta['grid_lat']:.4f}, {meta['grid_lon']:.4f}{elev}. "

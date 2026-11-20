@@ -30,9 +30,10 @@ import requests
 
 CIMIS_KEY = os.getenv("CIMIS_APPKEY", "")
 
-APP_VERSION = "2.5.0"
+APP_VERSION = "2.5.1"
 APP_UPDATED = "2026-11-19"
 # Changelog
+#   2.5.1  Charts: month/year date axis, full-date tooltips
 #   2.5.0  Imperial / Metric toggle (display, inputs, DD, CSV); saved with settings
 #   2.4.0  Saved settings (bookmarkable link + settings file); version shown in sidebar
 #   2.3.0  Open-Meteo fetches only selected variables; better rate-limit handling
@@ -570,6 +571,38 @@ def target_hits(dd, targets, biofix):
     return pd.DataFrame(rows)
 
 
+def date_axis(dates):
+    """Readable date axis: monthly ticks labeled "Apr 2026" for long ranges, weekly "Apr 19" for short ones."""
+    import altair as alt
+    d = pd.to_datetime(pd.Series(dates))
+    span = (d.max() - d.min()).days if len(d) else 0
+    if span > 75:
+        return alt.X("date:T", title=None, axis=alt.Axis(format="%b %Y", tickCount={"interval": "month", "step": 1},
+                                                         labelAngle=0, grid=True))
+    if span > 14:
+        return alt.X("date:T", title=None, axis=alt.Axis(format="%b %-d", tickCount={"interval": "week", "step": 1},
+                                                         labelAngle=0))
+    return alt.X("date:T", title=None, axis=alt.Axis(format="%b %-d", tickCount={"interval": "day", "step": 1},
+                                                     labelAngle=0))
+
+
+def temp_chart(daily, labels, u):
+    """Daily mean/max/min temperature lines with a month-aware date axis and full-date tooltips."""
+    import altair as alt
+    avg, mx, mn = labels
+    df = daily[["date", avg, mx, mn]].assign(date=pd.to_datetime(daily["date"]))
+    long = df.melt("date", var_name="Series", value_name="Temp")
+    color = alt.Color("Series:N", title=None, legend=alt.Legend(orient="bottom"),
+                      scale=alt.Scale(domain=[avg, mx, mn], range=["#1f5fbf", "#7fbff5", "#e8352f"]))
+    lines = alt.Chart(long).mark_line(strokeWidth=2).encode(
+        x=date_axis(df["date"]), y=alt.Y("Temp:Q", title=f"Temperature ({u})"), color=color)
+    hover = alt.Chart(df).mark_rule(opacity=0, strokeWidth=12).encode(
+        x="date:T",
+        tooltip=[alt.Tooltip("date:T", title="Date", format="%a %b %-d, %Y")]
+                + [alt.Tooltip(f"{c}:Q", title=c, format=".1f") for c in (mx, avg, mn)])
+    return alt.layer(lines, hover).properties(height=320)
+
+
 def dd_chart(dd, hits, y_title="Cumulative degree days"):
     """Cumulative DD line with a dot + label where each target is reached; dashed line for targets not reached."""
     import altair as alt
@@ -577,10 +610,10 @@ def dd_chart(dd, hits, y_title="Cumulative degree days"):
     LINE, DOT, MUTED = "#2a78d6", "#eb6834", "#8a8a85"
     base = dd[["date", "DD", "Cumulative DD"]].assign(date=pd.to_datetime(dd["date"]))
     line = alt.Chart(base).mark_line(color=LINE, strokeWidth=2).encode(
-        x=alt.X("date:T", title=None), y=alt.Y("Cumulative DD:Q", title=y_title))
+        x=date_axis(base["date"]), y=alt.Y("Cumulative DD:Q", title=y_title))
     hover = alt.Chart(base).mark_circle(size=120, opacity=0).encode(
         x="date:T", y="Cumulative DD:Q",
-        tooltip=[alt.Tooltip("date:T", title="Date"), alt.Tooltip("Cumulative DD:Q", format=",.1f"),
+        tooltip=[alt.Tooltip("date:T", title="Date", format="%a %b %-d, %Y"), alt.Tooltip("Cumulative DD:Q", format=",.1f"),
                  alt.Tooltip("DD:Q", title="DD that day", format=".1f")])
     layers = [line, hover]
     if hits is not None and len(hits):
@@ -983,8 +1016,8 @@ def main():
             daily["date"] = pd.to_datetime(daily["date"]).dt.date
             st.dataframe(daily, use_container_width=True, hide_index=True)
             if "Air temperature (°F)" in cols:
-                st.line_chart(daily.set_index("date")[[lbl(c, metric) for c in
-                                                       ("Air temperature (°F)", "Max temp (°F)", "Min temp (°F)")]])
+                labels = [lbl(c, metric) for c in ("Air temperature (°F)", "Max temp (°F)", "Min temp (°F)")]
+                st.altair_chart(temp_chart(daily, labels, u), use_container_width=True)
             downloads["daily"] = daily
 
     # Degree-day results
